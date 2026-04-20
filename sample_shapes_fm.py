@@ -25,10 +25,10 @@ import os
 import sys
 import textwrap
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy import ndimage
 from torchvision.utils import make_grid, save_image
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -39,11 +39,11 @@ from flow_matching.solver import ODESolver   # noqa: E402
 from flow_matching.utils import ModelWrapper # noqa: E402
 from models.unet import UNetModel            # noqa: E402
 
-# ── Hallucination detection config (same as detect_hallucinations_16x16.py) ──
-COLUMN_SLICES     = [(0, 5), (5, 10), (10, 15)]
-COLUMN_NAMES      = ["triangle", "square", "pentagon"]
-BRIGHT_PERCENTILE = 80
-MIN_SHAPE_AREA    = 3
+# ── Hallucination detection config ────────────────────────────────────────────
+COLUMN_SLICES   = [(0, 5), (5, 10), (10, 15)]
+COLUMN_NAMES    = ["triangle", "square", "pentagon"]
+MIN_SHAPE_AREA  = 3    # pixel area threshold để lọc noise
+MIN_CONTRAST    = 15   # max-min trong cột < ngưỡng này → cột trắng/đen hoàn toàn → 0 shape
 
 # ── Output dirs ───────────────────────────────────────────────────────────────
 CKPT_DIR   = os.path.join(REPO_ROOT, "shapes_fm_output", "checkpoints")
@@ -120,36 +120,68 @@ def to_uint8_numpy(img_01: torch.Tensor) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hallucination detection  (mirrors detect_hallucinations_16x16.py)
+# Hallucination detection — OpenCV contour-based
 # ─────────────────────────────────────────────────────────────────────────────
 
-def count_shapes_in_column(col_img: np.ndarray) -> int:
-    thresh = np.percentile(col_img, BRIGHT_PERCENTILE)
-    if thresh >= col_img.max():
+def count_shapes_in_column(col_uint8: np.ndarray) -> int:
+    """
+    Đếm số shape riêng biệt trong 1 cột ảnh.
+
+    col_uint8 : (H, W) uint8 grayscale, ví dụ shape (16, 5).
+
+    Pipeline:
+      1. Kiểm tra contrast — cột flat (background thuần) → 0 shape.
+      2. Otsu's threshold — tự động tách foreground/background.
+      3. connectedComponentsWithStats — đếm pixel thực của từng blob.
+         (Không dùng cv2.contourArea vì với shape rất nhỏ 3-9px,
+          contourArea trả về geometric area của polygon outline,
+          nhỏ hơn số pixel thực → bị lọc sai.)
+      4. Đếm blob có pixel_count >= MIN_SHAPE_AREA.
+    """
+    # Bước 1: cột flat → không có shape
+    contrast = int(col_uint8.max()) - int(col_uint8.min())
+    if contrast < MIN_CONTRAST:
         return 0
-    binary = (col_img >= thresh).astype(bool)
-    struct = ndimage.generate_binary_structure(2, 2)
-    labeled, n_regions = ndimage.label(binary, structure=struct)
-    return sum(1 for r in range(1, n_regions + 1) if (labeled == r).sum() >= MIN_SHAPE_AREA)
+
+    # Bước 2: Otsu's thresholding
+    _, binary = cv2.threshold(col_uint8, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Bước 3+4: connected components với pixel-accurate area
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    # stats[0] = background, stats[1:] = foreground blobs
+    # CC_STAT_AREA = số pixel thực của mỗi blob
+    return sum(
+        1 for i in range(1, num_labels)
+        if stats[i, cv2.CC_STAT_AREA] >= MIN_SHAPE_AREA
+    )
 
 
-def analyze_image(gray_img: np.ndarray) -> dict:
-    """gray_img: (16,16) float32 in [0,255]."""
+def analyze_image(img_uint8: np.ndarray) -> dict:
+    """
+    img_uint8: (16, 16, 3) uint8.
+    Chuyển sang grayscale rồi detect shape ở từng cột.
+    """
+    # Dùng grayscale chuẩn (weighted RGB) thay vì chỉ channel 0
+    gray = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2GRAY)   # (16, 16) uint8
+
     col_blobs = {}
     is_hall   = False
     for (c0, c1), name in zip(COLUMN_SLICES, COLUMN_NAMES):
-        n = count_shapes_in_column(gray_img[:, c0:c1])
+        n = count_shapes_in_column(gray[:, c0:c1])
         col_blobs[name] = n
         if n >= 2:
             is_hall = True
+
     score = sum(max(0, col_blobs[n] - 1) for n in COLUMN_NAMES)
     return {"is_hallucination": is_hall, "score": score, "col_blobs": col_blobs}
 
 
 def analyze_batch(imgs_uint8: np.ndarray) -> list[dict]:
-    """imgs_uint8: (B,16,16,3) uint8. Returns list of dicts."""
-    gray = imgs_uint8[:, :, :, 0].astype(np.float32)   # channel 0 as proxy
-    return [analyze_image(gray[i]) for i in range(len(gray))]
+    """imgs_uint8: (B, 16, 16, 3) uint8. Returns list of dicts."""
+    return [analyze_image(imgs_uint8[i]) for i in range(len(imgs_uint8))]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
