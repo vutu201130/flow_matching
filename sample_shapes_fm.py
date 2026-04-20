@@ -25,7 +25,6 @@ import os
 import sys
 import textwrap
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -35,15 +34,12 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, "examples", "image"))
 
-from flow_matching.solver import ODESolver   # noqa: E402
-from flow_matching.utils import ModelWrapper # noqa: E402
-from models.unet import UNetModel            # noqa: E402
-
-# ── Hallucination detection config ────────────────────────────────────────────
-COLUMN_SLICES   = [(0, 5), (5, 10), (10, 15)]
-COLUMN_NAMES    = ["triangle", "square", "pentagon"]
-MIN_SHAPE_AREA  = 3    # pixel area threshold để lọc noise
-MIN_CONTRAST    = 15   # max-min trong cột < ngưỡng này → cột trắng/đen hoàn toàn → 0 shape
+from flow_matching.solver import ODESolver                             # noqa: E402
+from flow_matching.utils import ModelWrapper                           # noqa: E402
+from models.unet import UNetModel                                      # noqa: E402
+from hallucination_detector import (                                   # noqa: E402
+    analyze_batch, summarize, COLUMN_NAMES,
+)
 
 # ── Output dirs ───────────────────────────────────────────────────────────────
 CKPT_DIR   = os.path.join(REPO_ROOT, "shapes_fm_output", "checkpoints")
@@ -119,69 +115,7 @@ def to_uint8_numpy(img_01: torch.Tensor) -> np.ndarray:
     return (img_01.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Hallucination detection — OpenCV contour-based
-# ─────────────────────────────────────────────────────────────────────────────
-
-def count_shapes_in_column(col_uint8: np.ndarray) -> int:
-    """
-    Đếm số shape riêng biệt trong 1 cột ảnh.
-
-    col_uint8 : (H, W) uint8 grayscale, ví dụ shape (16, 5).
-
-    Pipeline:
-      1. Kiểm tra contrast — cột flat (background thuần) → 0 shape.
-      2. Otsu's threshold — tự động tách foreground/background.
-      3. connectedComponentsWithStats — đếm pixel thực của từng blob.
-         (Không dùng cv2.contourArea vì với shape rất nhỏ 3-9px,
-          contourArea trả về geometric area của polygon outline,
-          nhỏ hơn số pixel thực → bị lọc sai.)
-      4. Đếm blob có pixel_count >= MIN_SHAPE_AREA.
-    """
-    # Bước 1: cột flat → không có shape
-    contrast = int(col_uint8.max()) - int(col_uint8.min())
-    if contrast < MIN_CONTRAST:
-        return 0
-
-    # Bước 2: Otsu's thresholding
-    _, binary = cv2.threshold(col_uint8, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Bước 3+4: connected components với pixel-accurate area
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-    # stats[0] = background, stats[1:] = foreground blobs
-    # CC_STAT_AREA = số pixel thực của mỗi blob
-    return sum(
-        1 for i in range(1, num_labels)
-        if stats[i, cv2.CC_STAT_AREA] >= MIN_SHAPE_AREA
-    )
-
-
-def analyze_image(img_uint8: np.ndarray) -> dict:
-    """
-    img_uint8: (16, 16, 3) uint8.
-    Chuyển sang grayscale rồi detect shape ở từng cột.
-    """
-    # Dùng grayscale chuẩn (weighted RGB) thay vì chỉ channel 0
-    gray = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2GRAY)   # (16, 16) uint8
-
-    col_blobs = {}
-    is_hall   = False
-    for (c0, c1), name in zip(COLUMN_SLICES, COLUMN_NAMES):
-        n = count_shapes_in_column(gray[:, c0:c1])
-        col_blobs[name] = n
-        if n >= 2:
-            is_hall = True
-
-    score = sum(max(0, col_blobs[n] - 1) for n in COLUMN_NAMES)
-    return {"is_hallucination": is_hall, "score": score, "col_blobs": col_blobs}
-
-
-def analyze_batch(imgs_uint8: np.ndarray) -> list[dict]:
-    """imgs_uint8: (B, 16, 16, 3) uint8. Returns list of dicts."""
-    return [analyze_image(imgs_uint8[i]) for i in range(len(imgs_uint8))]
+# Hallucination detection — imported from hallucination_detector.py
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,26 +233,45 @@ def run(args):
     all_noises_t = torch.cat(all_noises, dim=0)   # [N, 3, 16, 16]
     all_finals_t = torch.cat(all_finals, dim=0)   # [N, 3, 16, 16]
 
-    hall_indices = [i for i, a in enumerate(all_analyses) if a["is_hallucination"]]
-    norm_indices = [i for i, a in enumerate(all_analyses) if not a["is_hallucination"]]
+    s = summarize(all_analyses)
+    hall_indices   = s["hall_indices"]
+    norm_indices   = s["normal_indices"] if "normal_indices" in s else [
+        i for i, a in enumerate(all_analyses) if not a["is_hallucination"]
+    ]
+    empty_indices  = s["empty_indices"]
+    double_indices = s["double_col_indices"]
+    n_hall, n_norm = s["n_hall"], s["n_normal"]
+    n_empty, n_double = s["n_empty"], s["n_double_col"]
 
-    n_hall = len(hall_indices)
-    n_norm = len(norm_indices)
     print(f"\nResults: {n_hall} hallucinations / {args.n_total} total  ({100*n_hall/args.n_total:.2f}%)")
+    print(f"  ├─ empty image (0 shapes)  : {n_empty}")
+    print(f"  └─ double col (2+ in 1 col): {n_double}")
     for name in COLUMN_NAMES:
-        nc = sum(1 for a in all_analyses if a["col_blobs"][name] >= 2)
-        print(f"  {name:10s}: {nc} images with 2+ shapes")
+        print(f"       {name:10s}: {s['col_counts'][name]['2+']} images with 2+ shapes")
 
     # ─────────────────────────────────────────────────────────────
-    # Save hallucination grid
+    # Save hallucination grids — tách riêng 2 loại
     # ─────────────────────────────────────────────────────────────
-    print(f"\n── Saving hallucination grid ──")
+    print(f"\n── Saving hallucination grids ──")
+
+    if empty_indices:
+        imgs = [all_finals_t[i] for i in empty_indices[:200]]
+        save_image(make_labeled_grid(imgs, nrow=10),
+                   os.path.join(hall_dir, "grid_empty_images.png"))
+        print(f"  grid_empty_images.png  ({len(imgs)} images)")
+
+    if double_indices:
+        imgs = [all_finals_t[i] for i in double_indices[:200]]
+        save_image(make_labeled_grid(imgs, nrow=10),
+                   os.path.join(hall_dir, "grid_double_col.png"))
+        print(f"  grid_double_col.png  ({len(imgs)} images)")
+
     n_show_hall = min(n_hall, 200)
     if n_show_hall > 0:
         hall_imgs = [all_finals_t[i] for i in hall_indices[:n_show_hall]]
         grid = make_labeled_grid(hall_imgs, nrow=10)
-        save_image(grid, os.path.join(hall_dir, "grid_hallucinations.png"))
-        print(f"  grid_hallucinations.png  ({n_show_hall} images)")
+        save_image(grid, os.path.join(hall_dir, "grid_all_hallucinations.png"))
+        print(f"  grid_all_hallucinations.png  ({n_show_hall} images)")
 
     # ─────────────────────────────────────────────────────────────
     # Save normal grid
@@ -388,11 +341,14 @@ def run(args):
                 sys.stdout = f
 
                 print(f"Case {case_num+1}  |  sample_idx={global_idx}")
+                print(f"Hallucination type : {analysis['hall_type']}")
                 print(f"Hallucination score: {analysis['score']}")
                 for name in COLUMN_NAMES:
                     nb = analysis['col_blobs'][name]
-                    flag = " <-- HALLUCINATION" if nb >= 2 else ""
+                    flag = " <-- 2+ shapes" if nb >= 2 else ""
                     print(f"  {name:10s}: {nb} shape(s){flag}")
+                if analysis['hall_type'] == 'empty':
+                    print(f"  *** EMPTY IMAGE — no shapes detected anywhere ***")
                 print(f"\nFlow Matching is DETERMINISTIC.")
                 print(f"  noise_init.pt  → re-run with this noise to reproduce exactly.")
                 print(f"  intermediates  → {args.steps+1} steps × [3,16,16] float32")
@@ -417,6 +373,8 @@ def run(args):
         f.write(f"Total      : {args.n_total}\n")
         f.write(f"Steps      : {args.steps}\n")
         f.write(f"Hallucin.  : {n_hall} ({100*n_hall/args.n_total:.2f}%)\n")
+        f.write(f"  empty img: {n_empty} ({100*n_empty/args.n_total:.2f}%)\n")
+        f.write(f"  double col: {n_double} ({100*n_double/args.n_total:.2f}%)\n")
         f.write(f"Normal     : {n_norm} ({100*n_norm/args.n_total:.2f}%)\n\n")
         f.write("Per-column breakdown:\n")
         for name in COLUMN_NAMES:
@@ -430,7 +388,7 @@ def run(args):
     print(f"\nSummary: {stats_path}")
     print(f"\n{'='*60}")
     print(f"DONE")
-    print(f"  Hallucination grid : {hall_dir}/grid_hallucinations.png")
+    print(f"  Hallucination grids: {hall_dir}/")
     print(f"  Normal grid        : {norm_dir}/grid_normal.png")
     print(f"  Trace cases        : {trace_dir}/  ({n_trace} cases)")
     print(f"  Stats              : {stats_path}")
