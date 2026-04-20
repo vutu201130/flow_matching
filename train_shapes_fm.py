@@ -3,8 +3,16 @@ Flow Matching training script for 16x16x3 simple-shapes dataset.
 UNet: 64 model_channels, 3 levels (channel_mult=[1,2,2]), 3 res_blocks per level.
 
 Usage:
-    python train_shapes_fm.py
-    python train_shapes_fm.py --epochs 200 --batch_size 128 --lr 1e-4
+    # Train từ đầu
+    python train_shapes_fm.py --epochs 500 --batch_size 128 --lr 1e-4
+
+    # Resume từ checkpoint cụ thể, train tiếp đến epoch 500
+    python train_shapes_fm.py --resume shapes_fm_output/checkpoints/unet_epoch0200.pt --epochs 500
+
+    # Resume từ checkpoint mới nhất
+    python train_shapes_fm.py --resume latest --epochs 500
+
+--epochs luôn là TỔNG số epoch mục tiêu (không phải số epoch thêm vào).
 """
 
 import argparse
@@ -139,14 +147,30 @@ def train(args):
     # ── Flow matching path ──
     path = CondOTProbPath()
 
-    # ── Optimizer ──
+    # ── Optimizer + Scheduler ──
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.1
     )
 
+    # ── Resume từ checkpoint ──
+    start_epoch = 1
+    if args.resume:
+        ckpt_path = _resolve_resume(args.resume)
+        print(f"Resuming from: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        print(f"Resumed at epoch {ckpt['epoch']}  loss={ckpt.get('loss', float('nan')):.5f}")
+        if start_epoch > args.epochs:
+            print(f"Đã train đủ {args.epochs} epochs rồi. Tăng --epochs nếu muốn train thêm.")
+            return
+
     # ── Training loop ──
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
 
@@ -188,6 +212,7 @@ def train(args):
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "loss": avg_loss,
                 },
                 ckpt_path,
@@ -232,16 +257,31 @@ def _sample_and_save(model, device, epoch, n_samples=64, steps=100):
     model.train()
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _resolve_resume(resume: str) -> str:
+    """'latest' → path checkpoint mới nhất; path khác giữ nguyên."""
+    if resume == "latest":
+        import glob
+        ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "*.pt")))
+        if not ckpts:
+            raise FileNotFoundError(f"Không có checkpoint trong {CKPT_DIR}")
+        return ckpts[-1]
+    return resume
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="Flow Matching on simple-shapes-16x16")
-    p.add_argument("--epochs",       type=int,   default=300)
+    p.add_argument("--epochs",       type=int,   default=300,
+                   help="Tổng số epoch mục tiêu (default: 300)")
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=2e-4)
-    p.add_argument("--log_every",    type=int,   default=10,  help="Print loss every N epochs")
-    p.add_argument("--save_every",   type=int,   default=50,  help="Save checkpoint every N epochs")
-    p.add_argument("--sample_every", type=int,   default=50,  help="Generate samples every N epochs")
-    p.add_argument("--sample_steps", type=int,   default=100, help="ODE steps for sampling")
+    p.add_argument("--resume",       type=str,   default=None,
+                   help="Path checkpoint để resume, hoặc 'latest'")
+    p.add_argument("--log_every",    type=int,   default=10)
+    p.add_argument("--save_every",   type=int,   default=50)
+    p.add_argument("--sample_every", type=int,   default=50)
+    p.add_argument("--sample_steps", type=int,   default=100)
     return p.parse_args()
 
 
